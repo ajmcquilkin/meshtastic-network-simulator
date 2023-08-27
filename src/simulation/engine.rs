@@ -18,10 +18,10 @@ pub const SIMULATION_HEIGHT: u32 = 100;
 
 #[derive(Debug)]
 pub struct Engine {
-    pub docker_client: Docker,
-    pub primary_node_id: Option<String>,
-    pub simulation_bounds: Rectangle,
-    pub nodes: Vec<Node>,
+    docker_client: Docker,
+    primary_node_id: Option<String>,
+    simulation_bounds: Rectangle,
+    nodes: Vec<Node>,
 }
 
 impl Engine {
@@ -225,5 +225,13 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    pub fn get_nodes(&self) -> &Vec<Node> {
+        &self.nodes
+    }
+
+    pub fn get_nodes_mut(&mut self) -> &mut Vec<Node> {
+        &mut self.nodes
     }
 }

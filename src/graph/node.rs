@@ -49,3 +49,9 @@ impl Node {
         }
     }
 }
+
+impl Node {
+    pub fn get_full_tcp_address(node: &Node) -> String {
+        format!("localhost:{}", node.tcp_port).to_string()
+    }
+}
