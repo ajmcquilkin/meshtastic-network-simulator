@@ -6,6 +6,8 @@ use bollard::image::CreateImageOptions;
 use bollard::service::PortBinding;
 use bollard::Docker;
 use futures_util::TryStreamExt;
+use meshtastic::connections::helpers::generate_rand_id;
+use meshtastic::connections::stream_api::StreamApi;
 
 use crate::graph::node::Node;
 use crate::utils;
@@ -27,35 +29,9 @@ pub struct Engine {
     nodes: Vec<Node>,
 }
 
-impl Drop for Engine {
-    fn drop(&mut self) {
-        tokio::runtime::Handle::current().block_on(async {
-            if let Err(e) = self.remove_host_container().await {
-                println!("Failed to remove host container: {}", e);
-            }
-        });
-    }
-}
+// Private helper methods
 
 impl Engine {
-    pub fn new(num_nodes: usize) -> Result<Self, utils::GenericError> {
-        let docker_client = Docker::connect_with_socket_defaults()?;
-        let simulation_bounds = Rectangle {
-            width: SIMULATION_WIDTH,
-            height: SIMULATION_HEIGHT,
-            ..Default::default() // Only care about width and height
-        };
-
-        let nodes = Engine::initialize_nodes(num_nodes, simulation_bounds.clone());
-
-        Ok(Engine {
-            docker_client,
-            host_container_id: None,
-            nodes,
-            simulation_bounds,
-        })
-    }
-
     fn initialize_nodes(num_nodes: usize, bounding_box: Rectangle) -> Vec<Node> {
         let nodes = (0..num_nodes)
             .map(|id| Node::new(id as u32, bounding_box.get_random_contained_point()))
@@ -76,6 +52,28 @@ impl Engine {
             )
             .to_string(),
         ]
+    }
+}
+
+// Public engine API
+
+impl Engine {
+    pub fn new(num_nodes: usize) -> Result<Self, utils::GenericError> {
+        let docker_client = Docker::connect_with_socket_defaults()?;
+        let simulation_bounds = Rectangle {
+            width: SIMULATION_WIDTH,
+            height: SIMULATION_HEIGHT,
+            ..Default::default() // Only care about width and height
+        };
+
+        let nodes = Engine::initialize_nodes(num_nodes, simulation_bounds.clone());
+
+        Ok(Engine {
+            docker_client,
+            host_container_id: None,
+            nodes,
+            simulation_bounds,
+        })
     }
 
     pub async fn create_host_container(
@@ -164,6 +162,32 @@ impl Engine {
         Ok(())
     }
 
+    pub async fn connect_to_nodes(&mut self) -> Result<(), utils::GenericError> {
+        for node in self.nodes.iter_mut() {
+            let tcp_stream = StreamApi::build_tcp_stream(node.get_full_tcp_address()).await?;
+            let stream_api = StreamApi::new();
+
+            let (decoded_listener, stream_api) = stream_api.connect(tcp_stream).await;
+
+            let config_id = generate_rand_id();
+            let stream_api = stream_api.configure(config_id).await?;
+
+            let id = node.id.clone();
+            let handle = tokio::spawn(async move {
+                let mut decoded_listener = decoded_listener;
+                while let Some(message) = decoded_listener.recv().await {
+                    println!("[{}]: {:?}", id, message);
+                }
+                println!("Node {} listener stopped", id);
+            });
+
+            node.stream_api = Some(stream_api);
+            node.decoded_listener_handle = Some(handle);
+        }
+
+        Ok(())
+    }
+
     /// Wait for user to press "Enter" to continue
     pub fn wait_for_user(&mut self) {
         println!("Press \"Enter\" to continue");
@@ -171,6 +195,14 @@ impl Engine {
         let _input = std::io::stdin()
             .read_line(&mut line)
             .expect("Failed to read line");
+    }
+
+    pub async fn drop_node_connections(&mut self) -> Result<(), utils::GenericError> {
+        for node in self.nodes.iter_mut() {
+            node.disconnect().await?;
+        }
+
+        Ok(())
     }
 
     pub async fn remove_host_container(&mut self) -> Result<(), utils::GenericError> {
@@ -187,6 +219,8 @@ impl Engine {
                 }),
             )
             .await?;
+
+        println!("Removed host container: {}", container_id);
 
         Ok(())
     }
