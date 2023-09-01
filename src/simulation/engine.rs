@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::graph::node::Node;
+use crate::utils;
 use bollard::container::{Config, RemoveContainerOptions};
 use bollard::exec::{CreateExecOptions, StartExecOptions};
 use bollard::image::CreateImageOptions;
@@ -8,9 +10,11 @@ use bollard::Docker;
 use futures_util::TryStreamExt;
 use meshtastic::connections::helpers::generate_rand_id;
 use meshtastic::connections::stream_api::StreamApi;
-
-use crate::graph::node::Node;
-use crate::utils;
+use meshtastic::protobufs;
+use meshtastic::Message;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio_util::sync::CancellationToken;
 
 use super::rectangle::Rectangle;
 
@@ -20,26 +24,23 @@ pub const SIMULATION_HEIGHT: u32 = 100;
 pub const HW_ID_OFFSET: u32 = 16;
 pub const TCP_PORT_OFFSET: u32 = 4403;
 
-#[derive(Debug)]
 pub struct Engine {
     docker_client: Docker,
     host_container_id: Option<String>,
     #[allow(dead_code)]
     simulation_bounds: Rectangle,
     nodes: Vec<Node>,
+    broadcast_send: broadcast::Sender<protobufs::MeshPacket>,
+    broadcast_recv: broadcast::Receiver<protobufs::MeshPacket>,
 }
 
 // Private helper methods
 
 impl Engine {
     fn initialize_nodes(num_nodes: usize, bounding_box: Rectangle) -> Vec<Node> {
-        let nodes = (0..num_nodes)
+        (0..num_nodes)
             .map(|id| Node::new(id as u32, bounding_box.get_random_contained_point()))
-            .collect();
-
-        println!("Initialized nodes: {:?}", nodes);
-
-        nodes
+            .collect()
     }
 
     fn format_run_node_command(node: &Node) -> Vec<String> {
@@ -52,6 +53,23 @@ impl Engine {
             )
             .to_string(),
         ]
+    }
+
+    fn generate_forwarded_mesh_packet(
+        incoming_packet: protobufs::MeshPacket,
+    ) -> Result<protobufs::MeshPacket, String> {
+        let mut outgoing_packet = incoming_packet;
+
+        match outgoing_packet.payload_variant {
+            Some(protobufs::mesh_packet::PayloadVariant::Decoded(ref mut data)) => {
+                data.portnum = protobufs::PortNum::SimulatorApp.into();
+            }
+            _ => {
+                return Err("Received invalid mesh packet, skipping".to_string());
+            }
+        }
+
+        Ok(outgoing_packet)
     }
 }
 
@@ -67,12 +85,15 @@ impl Engine {
         };
 
         let nodes = Engine::initialize_nodes(num_nodes, simulation_bounds.clone());
+        let (send, recv) = broadcast::channel(64);
 
         Ok(Engine {
             docker_client,
             host_container_id: None,
             nodes,
             simulation_bounds,
+            broadcast_send: send,
+            broadcast_recv: recv,
         })
     }
 
@@ -162,6 +183,85 @@ impl Engine {
         Ok(())
     }
 
+    async fn spawn_from_radio_listener(
+        broadcast_send: broadcast::Sender<protobufs::MeshPacket>,
+        decoded_listener: UnboundedReceiver<protobufs::FromRadio>,
+        node_id: u32,
+    ) {
+        let mut decoded_listener = decoded_listener;
+
+        while let Some(from_radio_packet) = decoded_listener.recv().await {
+            let mesh_packet = match from_radio_packet.payload_variant {
+                Some(protobufs::from_radio::PayloadVariant::Packet(p)) => p,
+                _ => {
+                    println!(
+                        "[{}] Received non-mesh packet from radio, not forwarding: {:?}",
+                        node_id, from_radio_packet
+                    );
+                    continue;
+                }
+            };
+
+            println!(
+                "[{}] Forwarding mesh packet with id {} from radio {} to pub_sub",
+                node_id, mesh_packet.id, node_id
+            );
+
+            let forward_mesh_packet = match Engine::generate_forwarded_mesh_packet(mesh_packet) {
+                Ok(packet) => packet,
+                Err(e) => {
+                    eprintln!(
+                        "[{}] Error generating forwarded mesh packet: {}",
+                        node_id, e
+                    );
+                    continue;
+                }
+            };
+
+            match broadcast_send.send(forward_mesh_packet) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "[{}] Error sending message to pub sub channel: {}",
+                        node_id, e
+                    );
+                }
+            }
+        }
+    }
+
+    async fn spawn_to_radio_listener(
+        broadcast_recv: broadcast::Receiver<protobufs::MeshPacket>,
+        to_radio_channel: UnboundedSender<Vec<u8>>,
+        node_id: u32,
+    ) {
+        let mut broadcast_recv = broadcast_recv;
+
+        while let Ok(mesh_packet) = broadcast_recv.recv().await {
+            // Don't forward own messages to self
+
+            if mesh_packet.from == node_id {
+                continue;
+            }
+
+            println!(
+                "[{}] Forwarding mesh_packet from pub_sub with id {} from radio {} to radio {}",
+                node_id, mesh_packet.id, mesh_packet.from, node_id
+            );
+
+            let to_radio_packet = protobufs::ToRadio {
+                payload_variant: Some(protobufs::to_radio::PayloadVariant::Packet(mesh_packet)),
+            };
+
+            let encoded_packet = to_radio_packet.encode_to_vec();
+
+            if let Err(e) = to_radio_channel.send(encoded_packet) {
+                eprintln!("[{}] Error sending message to radio: {}", node_id, e);
+                continue;
+            }
+        }
+    }
+
     pub async fn connect_to_nodes(&mut self) -> Result<(), utils::GenericError> {
         for node in self.nodes.iter_mut() {
             let tcp_stream = StreamApi::build_tcp_stream(node.get_full_tcp_address()).await?;
@@ -172,17 +272,53 @@ impl Engine {
             let config_id = generate_rand_id();
             let stream_api = stream_api.configure(config_id).await?;
 
-            let id = node.id.clone();
-            let handle = tokio::spawn(async move {
-                let mut decoded_listener = decoded_listener;
-                while let Some(message) = decoded_listener.recv().await {
-                    println!("[{}]: {:?}", id, message);
+            let node_cancellation_token = CancellationToken::new();
+
+            let cancellation_token = node_cancellation_token.clone();
+            let broadcast_send = self.broadcast_send.clone();
+            let node_id = node.hw_id;
+
+            // Listen for packets from radio and forward them to pub/sub
+
+            let decoded_listener_handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        println!("Cancellation token cancelled, stopping from_radio worker");
+                    }
+                    _ = Engine::spawn_from_radio_listener(
+                        broadcast_send,
+                        decoded_listener,
+                        node_id,
+                    ) => {
+                        println!("[{}] from_radio worker stopped", node_id);
+                    }
                 }
-                println!("Node {} listener stopped", id);
             });
 
+            let cancellation_token = node_cancellation_token.clone();
+            let broadcast_recv = self.broadcast_recv.resubscribe();
+            let to_radio_channel = stream_api.get_write_input_sender()?;
+            let node_id = node.hw_id;
+
+            // Listen for packets from pub/sub or API and forward them to radio
+
+            let message_relay_handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        println!("Cancellation token cancelled, stopping message_relay worker");
+                    }
+                    _ = Engine::spawn_to_radio_listener(broadcast_recv, to_radio_channel, node_id) => {
+                        println!("[{}] to_radio worker stopped", node_id);
+                    }
+                }
+            });
+
+            // Update node with handles
+
             node.stream_api = Some(stream_api);
-            node.decoded_listener_handle = Some(handle);
+            node.decoded_listener_handle = Some(decoded_listener_handle);
+            node.message_relay_handle = Some(message_relay_handle);
+            node.cancellation_token = Some(node_cancellation_token);
         }
 
         Ok(())
