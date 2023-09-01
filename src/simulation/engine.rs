@@ -12,8 +12,10 @@ use meshtastic::connections::helpers::generate_rand_id;
 use meshtastic::connections::stream_api::StreamApi;
 use meshtastic::protobufs;
 use meshtastic::Message;
+use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::rectangle::Rectangle;
@@ -187,6 +189,8 @@ impl Engine {
         broadcast_send: broadcast::Sender<protobufs::MeshPacket>,
         decoded_listener: UnboundedReceiver<protobufs::FromRadio>,
         node_id: u32,
+        client_interface_node_hwid: u32,
+        to_client_channel: broadcast::Sender<Vec<u8>>,
     ) {
         let mut decoded_listener = decoded_listener;
 
@@ -207,16 +211,17 @@ impl Engine {
                 node_id, mesh_packet.id, node_id
             );
 
-            let forward_mesh_packet = match Engine::generate_forwarded_mesh_packet(mesh_packet) {
-                Ok(packet) => packet,
-                Err(e) => {
-                    eprintln!(
-                        "[{}] Error generating forwarded mesh packet: {}",
-                        node_id, e
-                    );
-                    continue;
-                }
-            };
+            let forward_mesh_packet =
+                match Engine::generate_forwarded_mesh_packet(mesh_packet.clone()) {
+                    Ok(packet) => packet,
+                    Err(e) => {
+                        eprintln!(
+                            "[{}] Error generating forwarded mesh packet: {}",
+                            node_id, e
+                        );
+                        continue;
+                    }
+                };
 
             match broadcast_send.send(forward_mesh_packet) {
                 Ok(_) => {}
@@ -225,6 +230,34 @@ impl Engine {
                         "[{}] Error sending message to pub sub channel: {}",
                         node_id, e
                     );
+                }
+            }
+
+            if node_id == client_interface_node_hwid {
+                println!(
+                    "[{}] Forwarding mesh packet with id {} from radio {} to client",
+                    node_id, mesh_packet.id, node_id
+                );
+
+                let to_client_packet = protobufs::FromRadio {
+                    id: generate_rand_id(),
+                    payload_variant: Some(protobufs::from_radio::PayloadVariant::Packet(
+                        mesh_packet,
+                    )),
+                };
+
+                let encoded_packet = to_client_packet.encode_to_vec();
+                let formatted_packet =
+                    meshtastic::connections::helpers::format_data_packet(encoded_packet);
+
+                match to_client_channel.send(formatted_packet) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "[{}] Error sending message to client channel: {}",
+                            node_id, e
+                        );
+                    }
                 }
             }
         }
@@ -262,7 +295,82 @@ impl Engine {
         }
     }
 
+    async fn spawn_from_client_handler(
+        from_client_channel: broadcast::Receiver<Vec<u8>>,
+        to_radio_channel: broadcast::Sender<protobufs::MeshPacket>,
+        node_id: u32,
+    ) {
+        let mut from_client_channel = from_client_channel;
+
+        while let Ok(mut encoded_packet) = from_client_channel.recv().await {
+            encoded_packet.drain(0..3); // Remove header from incoming packet
+
+            let decoded_packet = match protobufs::ToRadio::decode(encoded_packet.as_slice()) {
+                Ok(packet) => packet,
+                Err(e) => {
+                    eprintln!("[{}] Error decoding message from client: {}", node_id, e);
+                    continue;
+                }
+            };
+
+            let mesh_packet = match decoded_packet.payload_variant {
+                Some(protobufs::to_radio::PayloadVariant::Packet(p)) => p,
+                _ => {
+                    eprintln!(
+                        "[{}] Received non-mesh packet from client, not forwarding: {:?}",
+                        node_id, decoded_packet
+                    );
+                    continue;
+                }
+            };
+
+            println!(
+                "[{}] Forwarding mesh packet with id {} from connected client to radio {}",
+                node_id, mesh_packet.id, node_id
+            );
+
+            if let Err(e) = to_radio_channel.send(mesh_packet) {
+                eprintln!("[{}] Error sending message to radio: {}", node_id, e);
+                continue;
+            }
+        }
+    }
+
+    // async fn connect_to_node
+
     pub async fn connect_to_nodes(&mut self) -> Result<(), utils::GenericError> {
+        // Configure client/radio forwarding
+
+        let client_listener = tokio::net::TcpListener::bind("localhost:4402").await?;
+        let (to_client_channel, from_client_channel) = broadcast::channel::<Vec<u8>>(64);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut socket, addr) = client_listener.accept().await.expect("ERROR");
+                println!("Client connected from {}", addr);
+
+                let mut buf = [0u8; 1024];
+                let read_bytes = socket.read(&mut buf).await.expect("ERROR");
+
+                println!(
+                    "Received data from client: {:?}",
+                    buf[..read_bytes].to_vec()
+                );
+
+                // let stream_api = meshtastic::connections::stream_api::StreamApi::new();
+            }
+        });
+
+        let client_interface_node_hwid = self
+            .nodes
+            .get(0)
+            .ok_or(
+                "Could not find first node, cannot configure client/radio forwarding".to_string(),
+            )?
+            .hw_id;
+
+        // Configure nodes
+
         for node in self.nodes.iter_mut() {
             let tcp_stream = StreamApi::build_tcp_stream(node.get_full_tcp_address()).await?;
             let stream_api = StreamApi::new();
@@ -277,6 +385,8 @@ impl Engine {
             let cancellation_token = node_cancellation_token.clone();
             let broadcast_send = self.broadcast_send.clone();
             let node_id = node.hw_id;
+            let client_interface_node_hwid = client_interface_node_hwid;
+            let to_client_channel = to_client_channel.clone();
 
             // Listen for packets from radio and forward them to pub/sub
 
@@ -289,6 +399,8 @@ impl Engine {
                         broadcast_send,
                         decoded_listener,
                         node_id,
+                        client_interface_node_hwid,
+                        to_client_channel
                     ) => {
                         println!("[{}] from_radio worker stopped", node_id);
                     }
@@ -312,6 +424,28 @@ impl Engine {
                     }
                 }
             });
+
+            // Listen for packets from client and forward them to radio
+
+            if node.hw_id == client_interface_node_hwid {
+                let cancellation_token = node_cancellation_token.clone();
+                let broadcast_send = self.broadcast_send.clone();
+                let node_id = node.hw_id;
+                let from_client_channel = from_client_channel.resubscribe();
+
+                let from_client_handle = tokio::spawn(async move {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            println!("Cancellation token cancelled, stopping message_relay worker");
+                        }
+                        _ = Engine::spawn_from_client_handler(from_client_channel, broadcast_send, node_id) => {
+                            println!("[{}] to_radio worker stopped", node_id);
+                        }
+                    }
+                });
+
+                self.from_client_handle = Some(from_client_handle);
+            }
 
             // Update node with handles
 
