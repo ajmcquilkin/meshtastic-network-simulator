@@ -17,7 +17,6 @@ use meshtastic::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::rectangle::Rectangle;
@@ -27,21 +26,6 @@ pub const SIMULATION_HEIGHT: u32 = 100;
 pub const HW_ID_OFFSET: u32 = 16;
 pub const TCP_PORT_OFFSET: u32 = 4403;
 
-#[derive(Clone, Debug)]
-struct PacketVec(Vec<u8>);
-
-impl From<PacketVec> for Vec<u8> {
-    fn from(val: PacketVec) -> Self {
-        val.0
-    }
-}
-
-impl From<Vec<u8>> for PacketVec {
-    fn from(vec: Vec<u8>) -> Self {
-        PacketVec(vec)
-    }
-}
-
 pub struct Engine {
     docker_client: Docker,
     host_container_id: Option<String>,
@@ -50,7 +34,6 @@ pub struct Engine {
     nodes: Vec<Node>,
     pubsub_push_channel: broadcast::Sender<EncodedToRadioPacket>,
     pubsub_recv_channel: broadcast::Receiver<EncodedToRadioPacket>,
-    from_client_handle: Option<JoinHandle<()>>,
 }
 
 // Private helper methods
@@ -58,7 +41,20 @@ pub struct Engine {
 impl Engine {
     fn initialize_nodes(num_nodes: usize, bounding_box: Rectangle) -> Vec<Node> {
         (0..num_nodes)
-            .map(|id| Node::new(id as u32, bounding_box.get_random_contained_point()))
+            .map(|id| {
+                let id = id as u32;
+
+                let docker_tcp_port: u32 = 2 * id + TCP_PORT_OFFSET;
+                let client_tcp_port: u32 = 2 * id + TCP_PORT_OFFSET + 1;
+
+                Node::new(
+                    id,
+                    id + HW_ID_OFFSET,
+                    docker_tcp_port,
+                    client_tcp_port,
+                    bounding_box.get_random_contained_point(),
+                )
+            })
             .collect()
     }
 
@@ -68,7 +64,7 @@ impl Engine {
             "-c".to_string(),
             format!(
                 "./meshtasticd_linux_amd64 -d /home/node{} -h {} -p {}",
-                node.id, node.hw_id, node.tcp_port
+                node.id, node.hw_id, node.docker_tcp_port
             )
             .to_string(),
         ]
@@ -113,7 +109,6 @@ impl Engine {
             simulation_bounds,
             pubsub_push_channel: send,
             pubsub_recv_channel: recv,
-            from_client_handle: None,
         })
     }
 
@@ -138,14 +133,14 @@ impl Engine {
         let mut port_bindings = HashMap::new();
 
         for node in self.nodes.iter() {
-            let exposed_port = format!("{}/tcp", node.tcp_port);
+            let exposed_port = format!("{}/tcp", node.docker_tcp_port);
             exposed_ports.insert(exposed_port, empty.clone());
 
             port_bindings.insert(
-                format!("{}/tcp", node.tcp_port).to_string(),
+                format!("{}/tcp", node.docker_tcp_port).to_string(),
                 Some(vec![PortBinding {
                     host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(node.tcp_port.to_string()),
+                    host_port: Some(node.docker_tcp_port.to_string()),
                 }]),
             );
         }
@@ -211,35 +206,36 @@ impl Engine {
         pubsub_push_channel: broadcast::Sender<EncodedToRadioPacket>,
         decoded_listener: UnboundedReceiver<protobufs::FromRadio>,
         node_id: u32,
-        client_interface_node_hwid: u32,
         to_client_send_channel: broadcast::Sender<EncodedToRadioPacketWithHeader>,
     ) {
         let mut decoded_listener = decoded_listener;
 
         while let Some(from_radio_packet) = decoded_listener.recv().await {
-            if node_id == client_interface_node_hwid {
-                log::info!(
-                    "[{}] Forwarding packet from radio {} to client: {:?}",
-                    node_id,
-                    node_id,
-                    from_radio_packet
-                );
+            // Immediately forward all packets to client connection
 
-                let encoded_packet: EncodedToRadioPacket =
-                    from_radio_packet.clone().encode_to_vec().into();
-                let formatted_packet = format_data_packet(encoded_packet);
+            log::info!(
+                "[{}] Forwarding packet from radio {} to client: {:?}",
+                node_id,
+                node_id,
+                from_radio_packet
+            );
 
-                match to_client_send_channel.send(formatted_packet) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::error!(
-                            "[{}] Error sending message to client channel: {}",
-                            node_id,
-                            e
-                        );
-                    }
+            let encoded_packet: EncodedToRadioPacket =
+                from_radio_packet.clone().encode_to_vec().into();
+            let formatted_packet = format_data_packet(encoded_packet);
+
+            match to_client_send_channel.send(formatted_packet) {
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!(
+                        "[{}] Error sending message to client channel: {}",
+                        node_id,
+                        e
+                    );
                 }
             }
+
+            // Forward packet to other radios if it is a mesh packet
 
             let mesh_packet = match from_radio_packet.payload_variant {
                 Some(protobufs::from_radio::PayloadVariant::Packet(p)) => p,
@@ -308,15 +304,15 @@ impl Engine {
         }
     }
 
-    /// Routes packets from client to connected radio (at nodes[0])
+    /// Routes packets from client to connected radio
     async fn spawn_from_client_handler(
-        from_client_channel: broadcast::Receiver<EncodedToRadioPacketWithHeader>,
+        from_client_recv_channel: broadcast::Receiver<EncodedToRadioPacketWithHeader>,
         to_radio_channel: tokio::sync::mpsc::UnboundedSender<EncodedToRadioPacket>,
         node_id: u32,
     ) {
-        let mut from_client_channel = from_client_channel;
+        let mut from_client_recv_channel = from_client_recv_channel;
 
-        while let Ok(encoded_packet) = from_client_channel.recv().await {
+        while let Ok(encoded_packet) = from_client_recv_channel.recv().await {
             log::info!(
                 "[{}] Forwarding packet from client to radio {}",
                 node_id,
@@ -347,77 +343,95 @@ impl Engine {
     }
 
     pub async fn connect_to_nodes(&mut self) -> Result<(), utils::GenericError> {
-        // Configure client/radio forwarding
-
-        let client_listener = tokio::net::TcpListener::bind("localhost:4402").await?;
-
-        // Channel to allow forwarding of data from client to the connected radio
-        let (from_client_send_channel, from_client_recv_channel) =
-            broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
-
-        // Channel to allow the connected radio to forward data to the client
-        let (to_client_send_channel, to_client_recv_channel) =
-            broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
-
-        let handle = tokio::spawn(async move {
-            let to_client_recv_channel = to_client_recv_channel;
-            let from_client_send_channel = from_client_send_channel;
-
-            loop {
-                let (socket, addr) = client_listener.accept().await.expect("ERROR");
-                log::info!("Client connected from {}", addr);
-
-                let (mut from_client_half, mut to_client_half) = tokio::io::split(socket);
-
-                let from_client_send_channel = from_client_send_channel.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let mut buf = [0u8; 1024];
-                        let read_bytes = from_client_half.read(&mut buf).await.expect("ERROR");
-
-                        if read_bytes == 0 {
-                            continue;
-                        }
-
-                        let data: EncodedToRadioPacketWithHeader =
-                            buf[..read_bytes].to_vec().into();
-
-                        log::debug!("Received data from client: {:?}", data);
-
-                        match from_client_send_channel.send(data) {
-                            Ok(_) => {
-                                log::debug!("Successfully sent data to from_client channel");
-                            }
-                            Err(e) => {
-                                log::error!("Error sending data to from_client channel: {}", e);
-                            }
-                        };
-                    }
-                });
-
-                let mut to_client_recv_channel = to_client_recv_channel.resubscribe();
-                tokio::spawn(async move {
-                    while let Ok(data) = to_client_recv_channel.recv().await {
-                        log::trace!("Sending data to client: {:?}", data);
-                        let bytes_sent = to_client_half.write(data.data()).await.expect("ERROR");
-                        log::trace!("Sent {} bytes to client", bytes_sent);
-                    }
-                });
-            }
-        });
-
-        let client_interface_node_hwid = self
-            .nodes
-            .get(0)
-            .ok_or(
-                "Could not find first node, cannot configure client/radio forwarding".to_string(),
-            )?
-            .hw_id;
-
-        // Configure nodes
-
         for node in self.nodes.iter_mut() {
-            let tcp_stream = build_tcp_stream(node.get_full_tcp_address()).await?;
+            // Configure client/radio forwarding
+
+            let client_listener =
+                tokio::net::TcpListener::bind(node.get_full_client_tcp_address()).await?;
+
+            // Channel to allow forwarding of data from client to the connected radio
+            let (from_client_send_channel, from_client_recv_channel) =
+                broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
+
+            // Channel to allow the connected radio to forward data to the client
+            let (to_client_send_channel, to_client_recv_channel) =
+                broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
+
+            let client_forwarding_handle = tokio::spawn(async move {
+                let to_client_recv_channel = to_client_recv_channel;
+                let from_client_send_channel = from_client_send_channel;
+
+                loop {
+                    let (socket, addr) = client_listener.accept().await.expect("ERROR");
+                    log::info!("Client connected from {}", addr);
+
+                    let (mut from_client_half, mut to_client_half) = tokio::io::split(socket);
+
+                    // Forward data from client to radio
+
+                    let from_client_send_channel = from_client_send_channel.clone();
+
+                    let from_client_handle = tokio::spawn(async move {
+                        loop {
+                            let mut buf = [0u8; 1024];
+                            let read_bytes = from_client_half.read(&mut buf).await.expect("ERROR");
+
+                            if read_bytes == 0 {
+                                continue;
+                            }
+
+                            let data: EncodedToRadioPacketWithHeader =
+                                buf[..read_bytes].to_vec().into();
+
+                            log::debug!("Received data from client: {:?}", data);
+
+                            match from_client_send_channel.send(data) {
+                                Ok(_) => {
+                                    log::debug!("Successfully sent data to from_client channel");
+                                }
+                                Err(e) => {
+                                    log::error!("Error sending data to from_client channel: {}", e);
+                                }
+                            };
+                        }
+                    });
+
+                    // Forward data from radio to client
+
+                    let mut to_client_recv_channel = to_client_recv_channel.resubscribe();
+
+                    let to_client_handle = tokio::spawn(async move {
+                        while let Ok(data) = to_client_recv_channel.recv().await {
+                            log::trace!("Sending data to client: {:?}", data);
+                            let bytes_sent =
+                                to_client_half.write(data.data()).await.expect("ERROR");
+                            log::trace!("Sent {} bytes to client", bytes_sent);
+                        }
+                    });
+
+                    // Wait for handles to join before listening for next connection
+
+                    match from_client_handle.await {
+                        Ok(_) => {
+                            log::debug!("from_client_handle joined");
+                        }
+                        Err(e) => {
+                            log::error!("from_client_handle failed to join: {}", e);
+                        }
+                    }
+
+                    match to_client_handle.await {
+                        Ok(_) => {
+                            log::debug!("to_client_handle joined");
+                        }
+                        Err(e) => {
+                            log::error!("to_client_handle failed to join: {}", e);
+                        }
+                    }
+                }
+            });
+
+            let tcp_stream = build_tcp_stream(node.get_full_docker_tcp_address()).await?;
             let stream_api = StreamApi::new();
 
             let (decoded_listener, stream_api) = stream_api.connect(tcp_stream).await;
@@ -431,7 +445,6 @@ impl Engine {
             let pubsub_push_channel = self.pubsub_push_channel.clone();
             let node_id = node.hw_id;
 
-            let client_interface_node_hwid = client_interface_node_hwid;
             let to_client_send_channel = to_client_send_channel.clone();
 
             // Listen for packets from radio and forward them to pub/sub
@@ -445,7 +458,6 @@ impl Engine {
                         pubsub_push_channel,
                         decoded_listener,
                         node_id,
-                        client_interface_node_hwid,
                         to_client_send_channel
                     ) => {
                         log::debug!("[{}] from_radio worker stopped", node_id);
@@ -473,34 +485,36 @@ impl Engine {
 
             // Listen for packets from client and forward them to radio
 
-            if node.hw_id == client_interface_node_hwid {
-                log::info!("Configuring node {} as client interface", node.hw_id);
+            log::info!(
+                "Configuring node {} as client interface on port {}",
+                node.hw_id,
+                node.client_tcp_port
+            );
 
-                let cancellation_token = node_cancellation_token.clone();
-                let stream_api_to_radio_sender = stream_api.write_input_sender();
-                let node_id = node.hw_id;
-                let from_client_recv_channel = from_client_recv_channel.resubscribe();
+            let cancellation_token = node_cancellation_token.clone();
+            let stream_api_to_radio_sender = stream_api.write_input_sender();
+            let node_id = node.hw_id;
+            let from_client_recv_channel = from_client_recv_channel.resubscribe();
 
-                let from_client_handle = tokio::spawn(async move {
-                    tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            log::debug!("Cancellation token cancelled, stopping message_relay worker");
-                        }
-                        _ = Engine::spawn_from_client_handler(from_client_recv_channel, stream_api_to_radio_sender, node_id) => {
-                            log::debug!("[{}] to_radio worker stopped", node_id);
-                        }
+            let from_client_handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        log::debug!("Cancellation token cancelled, stopping message_relay worker");
                     }
-                });
-
-                self.from_client_handle = Some(from_client_handle);
-            }
+                    _ = Engine::spawn_from_client_handler(from_client_recv_channel, stream_api_to_radio_sender, node_id) => {
+                        log::debug!("[{}] to_radio worker stopped", node_id);
+                    }
+                }
+            });
 
             // Update node with handles
 
             node.stream_api = Some(stream_api);
+            node.cancellation_token = Some(node_cancellation_token);
+
             node.decoded_listener_handle = Some(decoded_listener_handle);
             node.message_relay_handle = Some(message_relay_handle);
-            node.cancellation_token = Some(node_cancellation_token);
+            node.client_forwarding_handle = Some(client_forwarding_handle);
         }
 
         Ok(())

@@ -1,38 +1,42 @@
-use meshtastic::connections::stream_api::StreamApi;
+use meshtastic::api::ConnectedStreamApi;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    simulation::{
-        engine::{HW_ID_OFFSET, TCP_PORT_OFFSET},
-        point::Point,
-    },
-    utils,
-};
+use crate::{simulation::point::Point, utils};
 
 #[derive(Debug)]
 pub struct Node {
     pub id: u32,
     pub hw_id: u32,
-    pub tcp_port: u32,
+    pub docker_tcp_port: u32,
+    pub client_tcp_port: u32,
 
     pub location: Point,
     pub is_router: bool,
     pub is_repeater: bool,
     pub hop_limit: u8, // 3 bytes max in firmware
 
-    pub stream_api: Option<StreamApi>,
+    pub stream_api: Option<ConnectedStreamApi>,
     pub cancellation_token: Option<CancellationToken>,
+
     pub decoded_listener_handle: Option<JoinHandle<()>>,
     pub message_relay_handle: Option<JoinHandle<()>>,
+    pub client_forwarding_handle: Option<JoinHandle<()>>,
 }
 
 impl Node {
-    pub fn new(id: u32, location: Point) -> Self {
+    pub fn new(
+        id: u32,
+        hw_id: u32,
+        docker_tcp_port: u32,
+        client_tcp_port: u32,
+        location: Point,
+    ) -> Self {
         Node {
             id,
-            hw_id: HW_ID_OFFSET + id,
-            tcp_port: TCP_PORT_OFFSET + id,
+            hw_id,
+            docker_tcp_port,
+            client_tcp_port,
 
             location,
             is_router: false,
@@ -41,8 +45,10 @@ impl Node {
 
             stream_api: None,
             cancellation_token: None,
+
             decoded_listener_handle: None,
             message_relay_handle: None,
+            client_forwarding_handle: None,
         }
     }
 
@@ -63,10 +69,18 @@ impl Node {
             message_relay_handle.await?;
         }
 
+        if let Some(client_forwarding_handle) = self.client_forwarding_handle.take() {
+            client_forwarding_handle.await?;
+        }
+
         Ok(())
     }
 
-    pub fn get_full_tcp_address(&self) -> String {
-        format!("localhost:{}", self.tcp_port).to_string()
+    pub fn get_full_docker_tcp_address(&self) -> String {
+        format!("localhost:{}", self.docker_tcp_port).to_string()
+    }
+
+    pub fn get_full_client_tcp_address(&self) -> String {
+        format!("localhost:{}", self.client_tcp_port).to_string()
     }
 }

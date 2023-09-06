@@ -6,7 +6,7 @@ pub mod graph;
 pub mod simulation;
 pub mod utils;
 
-pub const NUM_NODES: usize = 1;
+pub const NUM_NODES: usize = 3;
 const IMAGE_NAME: &str = "meshtastic/device-simulator";
 const IMAGE_TAG: &str = "2.2.0.9f6584b"; // Latest
 
