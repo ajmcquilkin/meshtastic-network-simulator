@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 use std::time::Duration;
 
 use simulation::engine::Engine;
@@ -26,6 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         .chain(std::io::stdout())
         // .chain(fern::log_file("output.log")?)
         .apply()?;
+
+    tauri::Builder::default()
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 
     let mut engine = Engine::new(NUM_NODES)?;
 
