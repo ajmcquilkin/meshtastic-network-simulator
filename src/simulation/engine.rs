@@ -11,8 +11,9 @@ use futures_util::TryStreamExt;
 use meshtastic::api::StreamApi;
 use meshtastic::protobufs;
 use meshtastic::types::{EncodedToRadioPacket, EncodedToRadioPacketWithHeader};
-use meshtastic::utils::stream::build_tcp_stream;
-use meshtastic::utils::{format_data_packet, generate_rand_id};
+use meshtastic::utils::{
+    format_data_packet, generate_rand_id, stream::build_tcp_stream, strip_data_packet_header,
+};
 use meshtastic::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
@@ -200,9 +201,93 @@ impl Engine {
         Ok(())
     }
 
+    async fn spawn_client_forward_worker(
+        to_client_recv_channel: broadcast::Receiver<EncodedToRadioPacketWithHeader>,
+        client_listener: tokio::net::TcpListener,
+        stream_api_to_radio_sender: UnboundedSender<EncodedToRadioPacket>,
+    ) {
+        let to_client_recv_channel = to_client_recv_channel;
+        let stream_api_to_radio_sender = stream_api_to_radio_sender;
+
+        loop {
+            let (socket, addr) = client_listener.accept().await.expect("ERROR");
+            log::info!("Client connected from {}", addr);
+
+            let (mut from_client_half, mut to_client_half) = tokio::io::split(socket);
+
+            // Forward data from client to radio
+
+            let stream_api_to_radio_sender = stream_api_to_radio_sender.clone();
+
+            let from_client_handle = tokio::spawn(async move {
+                loop {
+                    let mut buf = [0u8; 1024];
+                    let read_bytes = from_client_half.read(&mut buf).await.expect("ERROR");
+
+                    if read_bytes == 0 {
+                        continue;
+                    }
+
+                    let data: EncodedToRadioPacketWithHeader = buf[..read_bytes].to_vec().into();
+
+                    let stripped_data = match strip_data_packet_header(data) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            log::error!("Error stripping header from data: {}", e);
+                            continue;
+                        }
+                    };
+
+                    log::debug!("Received data from client: {:?}", stripped_data);
+
+                    match &stream_api_to_radio_sender.send(stripped_data) {
+                        Ok(_) => {
+                            log::debug!("Successfully sent data to from_client channel");
+                        }
+                        Err(e) => {
+                            log::error!("Error sending data to from_client channel: {}", e);
+                        }
+                    };
+                }
+            });
+
+            // Forward data from radio to client
+
+            let mut to_client_recv_channel = to_client_recv_channel.resubscribe();
+
+            let to_client_handle = tokio::spawn(async move {
+                while let Ok(data) = to_client_recv_channel.recv().await {
+                    log::trace!("Sending data to client: {:?}", data);
+                    let bytes_sent = to_client_half.write(data.data()).await.expect("ERROR");
+                    log::trace!("Sent {} bytes to client", bytes_sent);
+                }
+            });
+
+            // Wait for handles to join before listening for next connection
+
+            match from_client_handle.await {
+                Ok(_) => {
+                    log::debug!("from_client_handle joined");
+                }
+                Err(e) => {
+                    log::error!("from_client_handle failed to join: {}", e);
+                }
+            }
+
+            match to_client_handle.await {
+                Ok(_) => {
+                    log::debug!("to_client_handle joined");
+                }
+                Err(e) => {
+                    log::error!("to_client_handle failed to join: {}", e);
+                }
+            }
+        }
+    }
+
     /// Listens for packets coming from a radio connection
     /// and forwards all mesh packets to pub/sub.
-    async fn spawn_from_radio_listener(
+    async fn spawn_from_radio_worker(
         pubsub_push_channel: broadcast::Sender<EncodedToRadioPacket>,
         decoded_listener: UnboundedReceiver<protobufs::FromRadio>,
         node_id: u32,
@@ -289,7 +374,9 @@ impl Engine {
         }
     }
 
-    async fn spawn_to_radio_listener(
+    /// Listens for packets coming from pub/sub and forwards them to
+    /// the connected radio.
+    async fn spawn_to_radio_worker(
         pubsub_recv_channel: broadcast::Receiver<EncodedToRadioPacket>,
         stream_api_to_radio_sender: UnboundedSender<EncodedToRadioPacket>,
         node_id: u32,
@@ -304,132 +391,9 @@ impl Engine {
         }
     }
 
-    /// Routes packets from client to connected radio
-    async fn spawn_from_client_handler(
-        from_client_recv_channel: broadcast::Receiver<EncodedToRadioPacketWithHeader>,
-        to_radio_channel: tokio::sync::mpsc::UnboundedSender<EncodedToRadioPacket>,
-        node_id: u32,
-    ) {
-        let mut from_client_recv_channel = from_client_recv_channel;
-
-        while let Ok(encoded_packet) = from_client_recv_channel.recv().await {
-            log::info!(
-                "[{}] Forwarding packet from client to radio {}",
-                node_id,
-                node_id
-            );
-
-            let stripped_packet = match encoded_packet.data_vec().get(4..) {
-                Some(packet) => EncodedToRadioPacket::new(packet.to_vec()),
-                None => {
-                    log::error!(
-                        "[{}] Error stripping header from packet from client: {:?}",
-                        node_id,
-                        encoded_packet
-                    );
-                    continue;
-                }
-            };
-
-            if let Err(e) = to_radio_channel.send(stripped_packet) {
-                log::error!(
-                    "[{}] Error forwarding message from client to radio: {}",
-                    node_id,
-                    e
-                );
-                continue;
-            }
-        }
-    }
-
     pub async fn connect_to_nodes(&mut self) -> Result<(), utils::GenericError> {
         for node in self.nodes.iter_mut() {
-            // Configure client/radio forwarding
-
-            let client_listener =
-                tokio::net::TcpListener::bind(node.get_full_client_tcp_address()).await?;
-
-            // Channel to allow forwarding of data from client to the connected radio
-            let (from_client_send_channel, from_client_recv_channel) =
-                broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
-
-            // Channel to allow the connected radio to forward data to the client
-            let (to_client_send_channel, to_client_recv_channel) =
-                broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
-
-            let client_forwarding_handle = tokio::spawn(async move {
-                let to_client_recv_channel = to_client_recv_channel;
-                let from_client_send_channel = from_client_send_channel;
-
-                loop {
-                    let (socket, addr) = client_listener.accept().await.expect("ERROR");
-                    log::info!("Client connected from {}", addr);
-
-                    let (mut from_client_half, mut to_client_half) = tokio::io::split(socket);
-
-                    // Forward data from client to radio
-
-                    let from_client_send_channel = from_client_send_channel.clone();
-
-                    let from_client_handle = tokio::spawn(async move {
-                        loop {
-                            let mut buf = [0u8; 1024];
-                            let read_bytes = from_client_half.read(&mut buf).await.expect("ERROR");
-
-                            if read_bytes == 0 {
-                                continue;
-                            }
-
-                            let data: EncodedToRadioPacketWithHeader =
-                                buf[..read_bytes].to_vec().into();
-
-                            log::debug!("Received data from client: {:?}", data);
-
-                            match from_client_send_channel.send(data) {
-                                Ok(_) => {
-                                    log::debug!("Successfully sent data to from_client channel");
-                                }
-                                Err(e) => {
-                                    log::error!("Error sending data to from_client channel: {}", e);
-                                }
-                            };
-                        }
-                    });
-
-                    // Forward data from radio to client
-
-                    let mut to_client_recv_channel = to_client_recv_channel.resubscribe();
-
-                    let to_client_handle = tokio::spawn(async move {
-                        while let Ok(data) = to_client_recv_channel.recv().await {
-                            log::trace!("Sending data to client: {:?}", data);
-                            let bytes_sent =
-                                to_client_half.write(data.data()).await.expect("ERROR");
-                            log::trace!("Sent {} bytes to client", bytes_sent);
-                        }
-                    });
-
-                    // Wait for handles to join before listening for next connection
-
-                    match from_client_handle.await {
-                        Ok(_) => {
-                            log::debug!("from_client_handle joined");
-                        }
-                        Err(e) => {
-                            log::error!("from_client_handle failed to join: {}", e);
-                        }
-                    }
-
-                    match to_client_handle.await {
-                        Ok(_) => {
-                            log::debug!("to_client_handle joined");
-                        }
-                        Err(e) => {
-                            log::error!("to_client_handle failed to join: {}", e);
-                        }
-                    }
-                }
-            });
+            // Configure node stream_api connection
 
             let tcp_stream = build_tcp_stream(node.get_full_docker_tcp_address()).await?;
             let stream_api = StreamApi::new();
@@ -441,20 +405,55 @@ impl Engine {
 
             let node_cancellation_token = CancellationToken::new();
 
+            // Configure client/radio forwarding
+
+            log::info!(
+                "Configuring node {} as client interface on port {}",
+                node.hw_id,
+                node.client_tcp_port
+            );
+
+            let client_listener =
+                tokio::net::TcpListener::bind(node.get_full_client_tcp_address()).await?;
+
+            // Channel to allow the connected radio to forward data to the client
+            let (to_client_send_channel, to_client_recv_channel) =
+                broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
+
+            // Listen for connections from a client and proxy data to/from the radio
+
+            let cancellation_token = node_cancellation_token.clone();
+            let stream_api_to_radio_sender = stream_api.write_input_sender();
+            let node_id = node.hw_id;
+
+            let client_forwarding_handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        log::debug!("Cancellation token cancelled, stopping client_forwarding worker");
+                    }
+                    _ = Engine::spawn_client_forward_worker(
+                        to_client_recv_channel,
+                        client_listener,
+                        stream_api_to_radio_sender
+                    ) => {
+                        log::debug!("[{}] client_forwarding worker stopped", node_id);
+                    }
+                }
+            });
+
+            // Listen for packets from radio and forward them to pub/sub
+
             let cancellation_token = node_cancellation_token.clone();
             let pubsub_push_channel = self.pubsub_push_channel.clone();
             let node_id = node.hw_id;
-
             let to_client_send_channel = to_client_send_channel.clone();
-
-            // Listen for packets from radio and forward them to pub/sub
 
             let decoded_listener_handle = tokio::spawn(async move {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         log::debug!("Cancellation token cancelled, stopping from_radio worker");
                     }
-                    _ = Engine::spawn_from_radio_listener(
+                    _ = Engine::spawn_from_radio_worker(
                         pubsub_push_channel,
                         decoded_listener,
                         node_id,
@@ -477,31 +476,7 @@ impl Engine {
                     _ = cancellation_token.cancelled() => {
                         log::debug!("Cancellation token cancelled, stopping message_relay worker");
                     }
-                    _ = Engine::spawn_to_radio_listener(pubsub_recv_channel, stream_api_to_radio_sender, node_id) => {
-                        log::debug!("[{}] to_radio worker stopped", node_id);
-                    }
-                }
-            });
-
-            // Listen for packets from client and forward them to radio
-
-            log::info!(
-                "Configuring node {} as client interface on port {}",
-                node.hw_id,
-                node.client_tcp_port
-            );
-
-            let cancellation_token = node_cancellation_token.clone();
-            let stream_api_to_radio_sender = stream_api.write_input_sender();
-            let node_id = node.hw_id;
-            let from_client_recv_channel = from_client_recv_channel.resubscribe();
-
-            let from_client_handle = tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        log::debug!("Cancellation token cancelled, stopping message_relay worker");
-                    }
-                    _ = Engine::spawn_from_client_handler(from_client_recv_channel, stream_api_to_radio_sender, node_id) => {
+                    _ = Engine::spawn_to_radio_worker(pubsub_recv_channel, stream_api_to_radio_sender, node_id) => {
                         log::debug!("[{}] to_radio worker stopped", node_id);
                     }
                 }
