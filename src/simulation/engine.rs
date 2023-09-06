@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::graph::node::Node;
+use crate::graph::types::{Id, TcpPort};
 use crate::utils;
 use bollard::container::{Config, RemoveContainerOptions};
 use bollard::exec::{CreateExecOptions, StartExecOptions};
@@ -10,7 +11,7 @@ use bollard::Docker;
 use futures_util::TryStreamExt;
 use meshtastic::api::StreamApi;
 use meshtastic::protobufs;
-use meshtastic::types::{EncodedToRadioPacket, EncodedToRadioPacketWithHeader};
+use meshtastic::types::{EncodedToRadioPacket, EncodedToRadioPacketWithHeader, NodeId};
 use meshtastic::utils::{format_data_packet, generate_rand_id, stream::build_tcp_stream};
 use meshtastic::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -40,18 +41,22 @@ pub struct Engine {
 impl Engine {
     fn initialize_nodes(num_nodes: usize, bounding_box: Rectangle) -> Vec<Node> {
         (0..num_nodes)
-            .map(|id| {
-                let id = id as u32;
+            .map(|idx| {
+                let idx = idx as u32;
 
-                let docker_tcp_port: u32 = 2 * id + TCP_PORT_OFFSET;
-                let client_tcp_port: u32 = 2 * id + TCP_PORT_OFFSET + 1;
+                let id = Id::new(idx);
+                let hw_id = NodeId::new(idx + HW_ID_OFFSET);
+
+                let docker_tcp_port = TcpPort::new(2 * idx + TCP_PORT_OFFSET);
+                let client_tcp_port = TcpPort::new(2 * idx + TCP_PORT_OFFSET + 1);
 
                 Node::new(
                     id,
-                    id + HW_ID_OFFSET,
+                    hw_id,
                     docker_tcp_port,
                     client_tcp_port,
                     bounding_box.get_random_contained_point(),
+                    None,
                 )
             })
             .collect()
@@ -284,7 +289,7 @@ impl Engine {
     async fn spawn_from_radio_worker(
         pubsub_push_channel: broadcast::Sender<EncodedToRadioPacket>,
         decoded_listener: UnboundedReceiver<protobufs::FromRadio>,
-        node_id: u32,
+        node_id: NodeId,
         to_client_send_channel: broadcast::Sender<EncodedToRadioPacketWithHeader>,
     ) {
         let mut decoded_listener = decoded_listener;
@@ -373,7 +378,7 @@ impl Engine {
     async fn spawn_to_radio_worker(
         pubsub_recv_channel: broadcast::Receiver<EncodedToRadioPacket>,
         stream_api_to_radio_sender: UnboundedSender<EncodedToRadioPacketWithHeader>,
-        node_id: u32,
+        node_id: NodeId,
     ) {
         let mut pubsub_recv_channel = pubsub_recv_channel;
 

@@ -1,20 +1,22 @@
-use meshtastic::api::ConnectedStreamApi;
+use meshtastic::{api::ConnectedStreamApi, types::NodeId};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{simulation::point::Point, utils};
 
+use super::types::{HopLimit, Id, TcpPort};
+
 #[derive(Debug)]
 pub struct Node {
-    pub id: u32,
-    pub hw_id: u32,
-    pub docker_tcp_port: u32,
-    pub client_tcp_port: u32,
+    pub id: Id,
+    pub hw_id: NodeId,
+    pub docker_tcp_port: TcpPort,
+    pub client_tcp_port: TcpPort,
 
     pub location: Point,
     pub is_router: bool,
     pub is_repeater: bool,
-    pub hop_limit: u8, // 3 bytes max in firmware
+    pub hop_limit: HopLimit, // 3 bytes max in firmware
 
     pub stream_api: Option<ConnectedStreamApi>,
     pub cancellation_token: Option<CancellationToken>,
@@ -26,11 +28,12 @@ pub struct Node {
 
 impl Node {
     pub fn new(
-        id: u32,
-        hw_id: u32,
-        docker_tcp_port: u32,
-        client_tcp_port: u32,
+        id: Id,
+        hw_id: NodeId,
+        docker_tcp_port: TcpPort,
+        client_tcp_port: TcpPort,
         location: Point,
+        hop_limit: Option<HopLimit>,
     ) -> Self {
         Node {
             id,
@@ -41,7 +44,7 @@ impl Node {
             location,
             is_router: false,
             is_repeater: false,
-            hop_limit: 3,
+            hop_limit: hop_limit.unwrap_or_default(),
 
             stream_api: None,
             cancellation_token: None,
