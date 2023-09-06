@@ -11,9 +11,7 @@ use futures_util::TryStreamExt;
 use meshtastic::api::StreamApi;
 use meshtastic::protobufs;
 use meshtastic::types::{EncodedToRadioPacket, EncodedToRadioPacketWithHeader};
-use meshtastic::utils::{
-    format_data_packet, generate_rand_id, stream::build_tcp_stream, strip_data_packet_header,
-};
+use meshtastic::utils::{format_data_packet, generate_rand_id, stream::build_tcp_stream};
 use meshtastic::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
@@ -204,7 +202,7 @@ impl Engine {
     async fn spawn_client_forward_worker(
         to_client_recv_channel: broadcast::Receiver<EncodedToRadioPacketWithHeader>,
         client_listener: tokio::net::TcpListener,
-        stream_api_to_radio_sender: UnboundedSender<EncodedToRadioPacket>,
+        stream_api_to_radio_sender: UnboundedSender<EncodedToRadioPacketWithHeader>,
     ) {
         let to_client_recv_channel = to_client_recv_channel;
         let stream_api_to_radio_sender = stream_api_to_radio_sender;
@@ -230,17 +228,9 @@ impl Engine {
 
                     let data: EncodedToRadioPacketWithHeader = buf[..read_bytes].to_vec().into();
 
-                    let stripped_data = match strip_data_packet_header(data) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            log::error!("Error stripping header from data: {}", e);
-                            continue;
-                        }
-                    };
+                    log::debug!("Received data from client: {:?}", data);
 
-                    log::debug!("Received data from client: {:?}", stripped_data);
-
-                    match &stream_api_to_radio_sender.send(stripped_data) {
+                    match &stream_api_to_radio_sender.send(data) {
                         Ok(_) => {
                             log::debug!("Successfully sent data to from_client channel");
                         }
@@ -265,6 +255,8 @@ impl Engine {
 
             // Wait for handles to join before listening for next connection
 
+            log::debug!("Client disonnected, waiting for handles to join...");
+
             match from_client_handle.await {
                 Ok(_) => {
                     log::debug!("from_client_handle joined");
@@ -282,6 +274,8 @@ impl Engine {
                     log::error!("to_client_handle failed to join: {}", e);
                 }
             }
+
+            log::debug!("Handles joined, waiting for next connection...");
         }
     }
 
@@ -378,13 +372,15 @@ impl Engine {
     /// the connected radio.
     async fn spawn_to_radio_worker(
         pubsub_recv_channel: broadcast::Receiver<EncodedToRadioPacket>,
-        stream_api_to_radio_sender: UnboundedSender<EncodedToRadioPacket>,
+        stream_api_to_radio_sender: UnboundedSender<EncodedToRadioPacketWithHeader>,
         node_id: u32,
     ) {
         let mut pubsub_recv_channel = pubsub_recv_channel;
 
         while let Ok(encoded_packet) = pubsub_recv_channel.recv().await {
-            if let Err(e) = stream_api_to_radio_sender.send(encoded_packet) {
+            let packet_with_header = format_data_packet(encoded_packet);
+
+            if let Err(e) = stream_api_to_radio_sender.send(packet_with_header) {
                 eprintln!("[{}] Error sending message to radio: {}", node_id, e);
                 continue;
             }

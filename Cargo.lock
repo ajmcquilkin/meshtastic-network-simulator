@@ -678,9 +678,9 @@ dependencies = [
 
 [[package]]
 name = "meshtastic"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dcdc39394bc72a8de95c37ac4f59b46028e311f6e9147cff54684ad95233333"
+checksum = "3facc8574a7f624f9b928357cd77557d2733f4ef7b5955e33174d28963ea8889"
 dependencies = [
  "futures-util",
  "log",

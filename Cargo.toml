@@ -17,4 +17,4 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4.20"
 humantime = "2.1.0"
 fern = "0.6.2"
-meshtastic = "0.1.2"
+meshtastic = "0.1.3"
