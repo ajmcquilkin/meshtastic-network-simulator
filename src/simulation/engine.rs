@@ -8,11 +8,13 @@ use bollard::image::CreateImageOptions;
 use bollard::service::PortBinding;
 use bollard::Docker;
 use futures_util::TryStreamExt;
-use meshtastic::connections::helpers::generate_rand_id;
-use meshtastic::connections::stream_api::StreamApi;
+use meshtastic::api::StreamApi;
 use meshtastic::protobufs;
+use meshtastic::types::{EncodedToRadioPacket, EncodedToRadioPacketWithHeader};
+use meshtastic::utils::stream::build_tcp_stream;
+use meshtastic::utils::{format_data_packet, generate_rand_id};
 use meshtastic::Message;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -20,11 +22,25 @@ use tokio_util::sync::CancellationToken;
 
 use super::rectangle::Rectangle;
 
-pub const IMAGE_NAME: &str = "meshtastic/device-simulator";
 pub const SIMULATION_WIDTH: u32 = 100;
 pub const SIMULATION_HEIGHT: u32 = 100;
 pub const HW_ID_OFFSET: u32 = 16;
 pub const TCP_PORT_OFFSET: u32 = 4403;
+
+#[derive(Clone, Debug)]
+struct PacketVec(Vec<u8>);
+
+impl From<PacketVec> for Vec<u8> {
+    fn from(val: PacketVec) -> Self {
+        val.0
+    }
+}
+
+impl From<Vec<u8>> for PacketVec {
+    fn from(vec: Vec<u8>) -> Self {
+        PacketVec(vec)
+    }
+}
 
 pub struct Engine {
     docker_client: Docker,
@@ -32,8 +48,9 @@ pub struct Engine {
     #[allow(dead_code)]
     simulation_bounds: Rectangle,
     nodes: Vec<Node>,
-    broadcast_send: broadcast::Sender<protobufs::MeshPacket>,
-    broadcast_recv: broadcast::Receiver<protobufs::MeshPacket>,
+    pubsub_push_channel: broadcast::Sender<EncodedToRadioPacket>,
+    pubsub_recv_channel: broadcast::Receiver<EncodedToRadioPacket>,
+    from_client_handle: Option<JoinHandle<()>>,
 }
 
 // Private helper methods
@@ -94,17 +111,20 @@ impl Engine {
             host_container_id: None,
             nodes,
             simulation_bounds,
-            broadcast_send: send,
-            broadcast_recv: recv,
+            pubsub_push_channel: send,
+            pubsub_recv_channel: recv,
+            from_client_handle: None,
         })
     }
 
     pub async fn create_host_container(
         &mut self,
         image_name: String,
+        tag: String,
     ) -> Result<(), utils::GenericError> {
         let create_image_options: CreateImageOptions<String> = CreateImageOptions {
             from_image: image_name.clone(),
+            tag,
             ..Default::default()
         };
 
@@ -180,184 +200,209 @@ impl Engine {
                 .await?;
         }
 
-        println!("Host container id: {}", container_id);
+        log::info!("Host container id: {}", container_id);
         self.host_container_id = Some(container_id);
         Ok(())
     }
 
+    /// Listens for packets coming from a radio connection
+    /// and forwards all mesh packets to pub/sub.
     async fn spawn_from_radio_listener(
-        broadcast_send: broadcast::Sender<protobufs::MeshPacket>,
+        pubsub_push_channel: broadcast::Sender<EncodedToRadioPacket>,
         decoded_listener: UnboundedReceiver<protobufs::FromRadio>,
         node_id: u32,
         client_interface_node_hwid: u32,
-        to_client_channel: broadcast::Sender<Vec<u8>>,
+        to_client_send_channel: broadcast::Sender<EncodedToRadioPacketWithHeader>,
     ) {
         let mut decoded_listener = decoded_listener;
 
         while let Some(from_radio_packet) = decoded_listener.recv().await {
+            if node_id == client_interface_node_hwid {
+                log::info!(
+                    "[{}] Forwarding packet from radio {} to client: {:?}",
+                    node_id,
+                    node_id,
+                    from_radio_packet
+                );
+
+                let encoded_packet: EncodedToRadioPacket =
+                    from_radio_packet.clone().encode_to_vec().into();
+                let formatted_packet = format_data_packet(encoded_packet);
+
+                match to_client_send_channel.send(formatted_packet) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::error!(
+                            "[{}] Error sending message to client channel: {}",
+                            node_id,
+                            e
+                        );
+                    }
+                }
+            }
+
             let mesh_packet = match from_radio_packet.payload_variant {
                 Some(protobufs::from_radio::PayloadVariant::Packet(p)) => p,
                 _ => {
-                    println!(
-                        "[{}] Received non-mesh packet from radio, not forwarding: {:?}",
-                        node_id, from_radio_packet
+                    log::debug!(
+                        "[{}] Received non-mesh packet from radio, not forwarding...",
+                        node_id,
                     );
                     continue;
                 }
             };
 
-            println!(
+            log::info!(
                 "[{}] Forwarding mesh packet with id {} from radio {} to pub_sub",
-                node_id, mesh_packet.id, node_id
+                node_id,
+                mesh_packet.id,
+                node_id
             );
 
             let forward_mesh_packet =
                 match Engine::generate_forwarded_mesh_packet(mesh_packet.clone()) {
                     Ok(packet) => packet,
                     Err(e) => {
-                        eprintln!(
+                        log::error!(
                             "[{}] Error generating forwarded mesh packet: {}",
-                            node_id, e
+                            node_id,
+                            e
                         );
                         continue;
                     }
                 };
 
-            match broadcast_send.send(forward_mesh_packet) {
+            let to_radio_packet = protobufs::ToRadio {
+                payload_variant: Some(protobufs::to_radio::PayloadVariant::Packet(
+                    forward_mesh_packet,
+                )),
+            };
+
+            let encoded_packet: EncodedToRadioPacket = to_radio_packet.encode_to_vec().into();
+
+            match pubsub_push_channel.send(encoded_packet) {
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!(
+                    log::error!(
                         "[{}] Error sending message to pub sub channel: {}",
-                        node_id, e
+                        node_id,
+                        e
                     );
-                }
-            }
-
-            if node_id == client_interface_node_hwid {
-                println!(
-                    "[{}] Forwarding mesh packet with id {} from radio {} to client",
-                    node_id, mesh_packet.id, node_id
-                );
-
-                let to_client_packet = protobufs::FromRadio {
-                    id: generate_rand_id(),
-                    payload_variant: Some(protobufs::from_radio::PayloadVariant::Packet(
-                        mesh_packet,
-                    )),
-                };
-
-                let encoded_packet = to_client_packet.encode_to_vec();
-                let formatted_packet =
-                    meshtastic::connections::helpers::format_data_packet(encoded_packet);
-
-                match to_client_channel.send(formatted_packet) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "[{}] Error sending message to client channel: {}",
-                            node_id, e
-                        );
-                    }
                 }
             }
         }
     }
 
     async fn spawn_to_radio_listener(
-        broadcast_recv: broadcast::Receiver<protobufs::MeshPacket>,
-        to_radio_channel: UnboundedSender<Vec<u8>>,
+        pubsub_recv_channel: broadcast::Receiver<EncodedToRadioPacket>,
+        stream_api_to_radio_sender: UnboundedSender<EncodedToRadioPacket>,
         node_id: u32,
     ) {
-        let mut broadcast_recv = broadcast_recv;
+        let mut pubsub_recv_channel = pubsub_recv_channel;
 
-        while let Ok(mesh_packet) = broadcast_recv.recv().await {
-            // Don't forward own messages to self
-
-            if mesh_packet.from == node_id {
-                continue;
-            }
-
-            println!(
-                "[{}] Forwarding mesh_packet from pub_sub with id {} from radio {} to radio {}",
-                node_id, mesh_packet.id, mesh_packet.from, node_id
-            );
-
-            let to_radio_packet = protobufs::ToRadio {
-                payload_variant: Some(protobufs::to_radio::PayloadVariant::Packet(mesh_packet)),
-            };
-
-            let encoded_packet = to_radio_packet.encode_to_vec();
-
-            if let Err(e) = to_radio_channel.send(encoded_packet) {
+        while let Ok(encoded_packet) = pubsub_recv_channel.recv().await {
+            if let Err(e) = stream_api_to_radio_sender.send(encoded_packet) {
                 eprintln!("[{}] Error sending message to radio: {}", node_id, e);
                 continue;
             }
         }
     }
 
+    /// Routes packets from client to connected radio (at nodes[0])
     async fn spawn_from_client_handler(
-        from_client_channel: broadcast::Receiver<Vec<u8>>,
-        to_radio_channel: broadcast::Sender<protobufs::MeshPacket>,
+        from_client_channel: broadcast::Receiver<EncodedToRadioPacketWithHeader>,
+        to_radio_channel: tokio::sync::mpsc::UnboundedSender<EncodedToRadioPacket>,
         node_id: u32,
     ) {
         let mut from_client_channel = from_client_channel;
 
-        while let Ok(mut encoded_packet) = from_client_channel.recv().await {
-            encoded_packet.drain(0..3); // Remove header from incoming packet
+        while let Ok(encoded_packet) = from_client_channel.recv().await {
+            log::info!(
+                "[{}] Forwarding packet from client to radio {}",
+                node_id,
+                node_id
+            );
 
-            let decoded_packet = match protobufs::ToRadio::decode(encoded_packet.as_slice()) {
-                Ok(packet) => packet,
-                Err(e) => {
-                    eprintln!("[{}] Error decoding message from client: {}", node_id, e);
-                    continue;
-                }
-            };
-
-            let mesh_packet = match decoded_packet.payload_variant {
-                Some(protobufs::to_radio::PayloadVariant::Packet(p)) => p,
-                _ => {
-                    eprintln!(
-                        "[{}] Received non-mesh packet from client, not forwarding: {:?}",
-                        node_id, decoded_packet
+            let stripped_packet = match encoded_packet.data_vec().get(4..) {
+                Some(packet) => EncodedToRadioPacket::new(packet.to_vec()),
+                None => {
+                    log::error!(
+                        "[{}] Error stripping header from packet from client: {:?}",
+                        node_id,
+                        encoded_packet
                     );
                     continue;
                 }
             };
 
-            println!(
-                "[{}] Forwarding mesh packet with id {} from connected client to radio {}",
-                node_id, mesh_packet.id, node_id
-            );
-
-            if let Err(e) = to_radio_channel.send(mesh_packet) {
-                eprintln!("[{}] Error sending message to radio: {}", node_id, e);
+            if let Err(e) = to_radio_channel.send(stripped_packet) {
+                log::error!(
+                    "[{}] Error forwarding message from client to radio: {}",
+                    node_id,
+                    e
+                );
                 continue;
             }
         }
     }
 
-    // async fn connect_to_node
-
     pub async fn connect_to_nodes(&mut self) -> Result<(), utils::GenericError> {
         // Configure client/radio forwarding
 
         let client_listener = tokio::net::TcpListener::bind("localhost:4402").await?;
-        let (to_client_channel, from_client_channel) = broadcast::channel::<Vec<u8>>(64);
+
+        // Channel to allow forwarding of data from client to the connected radio
+        let (from_client_send_channel, from_client_recv_channel) =
+            broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
+
+        // Channel to allow the connected radio to forward data to the client
+        let (to_client_send_channel, to_client_recv_channel) =
+            broadcast::channel::<EncodedToRadioPacketWithHeader>(64);
 
         let handle = tokio::spawn(async move {
+            let to_client_recv_channel = to_client_recv_channel;
+            let from_client_send_channel = from_client_send_channel;
+
             loop {
-                let (mut socket, addr) = client_listener.accept().await.expect("ERROR");
-                println!("Client connected from {}", addr);
+                let (socket, addr) = client_listener.accept().await.expect("ERROR");
+                log::info!("Client connected from {}", addr);
 
-                let mut buf = [0u8; 1024];
-                let read_bytes = socket.read(&mut buf).await.expect("ERROR");
+                let (mut from_client_half, mut to_client_half) = tokio::io::split(socket);
 
-                println!(
-                    "Received data from client: {:?}",
-                    buf[..read_bytes].to_vec()
-                );
+                let from_client_send_channel = from_client_send_channel.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut buf = [0u8; 1024];
+                        let read_bytes = from_client_half.read(&mut buf).await.expect("ERROR");
 
-                // let stream_api = meshtastic::connections::stream_api::StreamApi::new();
+                        if read_bytes == 0 {
+                            continue;
+                        }
+
+                        let data: EncodedToRadioPacketWithHeader =
+                            buf[..read_bytes].to_vec().into();
+
+                        log::debug!("Received data from client: {:?}", data);
+
+                        match from_client_send_channel.send(data) {
+                            Ok(_) => {
+                                log::debug!("Successfully sent data to from_client channel");
+                            }
+                            Err(e) => {
+                                log::error!("Error sending data to from_client channel: {}", e);
+                            }
+                        };
+                    }
+                });
+
+                let mut to_client_recv_channel = to_client_recv_channel.resubscribe();
+                tokio::spawn(async move {
+                    while let Ok(data) = to_client_recv_channel.recv().await {
+                        log::trace!("Sending data to client: {:?}", data);
+                        let bytes_sent = to_client_half.write(data.data()).await.expect("ERROR");
+                        log::trace!("Sent {} bytes to client", bytes_sent);
+                    }
+                });
             }
         });
 
@@ -372,7 +417,7 @@ impl Engine {
         // Configure nodes
 
         for node in self.nodes.iter_mut() {
-            let tcp_stream = StreamApi::build_tcp_stream(node.get_full_tcp_address()).await?;
+            let tcp_stream = build_tcp_stream(node.get_full_tcp_address()).await?;
             let stream_api = StreamApi::new();
 
             let (decoded_listener, stream_api) = stream_api.connect(tcp_stream).await;
@@ -383,33 +428,34 @@ impl Engine {
             let node_cancellation_token = CancellationToken::new();
 
             let cancellation_token = node_cancellation_token.clone();
-            let broadcast_send = self.broadcast_send.clone();
+            let pubsub_push_channel = self.pubsub_push_channel.clone();
             let node_id = node.hw_id;
+
             let client_interface_node_hwid = client_interface_node_hwid;
-            let to_client_channel = to_client_channel.clone();
+            let to_client_send_channel = to_client_send_channel.clone();
 
             // Listen for packets from radio and forward them to pub/sub
 
             let decoded_listener_handle = tokio::spawn(async move {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
-                        println!("Cancellation token cancelled, stopping from_radio worker");
+                        log::debug!("Cancellation token cancelled, stopping from_radio worker");
                     }
                     _ = Engine::spawn_from_radio_listener(
-                        broadcast_send,
+                        pubsub_push_channel,
                         decoded_listener,
                         node_id,
                         client_interface_node_hwid,
-                        to_client_channel
+                        to_client_send_channel
                     ) => {
-                        println!("[{}] from_radio worker stopped", node_id);
+                        log::debug!("[{}] from_radio worker stopped", node_id);
                     }
                 }
             });
 
             let cancellation_token = node_cancellation_token.clone();
-            let broadcast_recv = self.broadcast_recv.resubscribe();
-            let to_radio_channel = stream_api.get_write_input_sender()?;
+            let pubsub_recv_channel = self.pubsub_recv_channel.resubscribe();
+            let stream_api_to_radio_sender = stream_api.write_input_sender();
             let node_id = node.hw_id;
 
             // Listen for packets from pub/sub or API and forward them to radio
@@ -417,10 +463,10 @@ impl Engine {
             let message_relay_handle = tokio::spawn(async move {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
-                        println!("Cancellation token cancelled, stopping message_relay worker");
+                        log::debug!("Cancellation token cancelled, stopping message_relay worker");
                     }
-                    _ = Engine::spawn_to_radio_listener(broadcast_recv, to_radio_channel, node_id) => {
-                        println!("[{}] to_radio worker stopped", node_id);
+                    _ = Engine::spawn_to_radio_listener(pubsub_recv_channel, stream_api_to_radio_sender, node_id) => {
+                        log::debug!("[{}] to_radio worker stopped", node_id);
                     }
                 }
             });
@@ -428,18 +474,20 @@ impl Engine {
             // Listen for packets from client and forward them to radio
 
             if node.hw_id == client_interface_node_hwid {
+                log::info!("Configuring node {} as client interface", node.hw_id);
+
                 let cancellation_token = node_cancellation_token.clone();
-                let broadcast_send = self.broadcast_send.clone();
+                let stream_api_to_radio_sender = stream_api.write_input_sender();
                 let node_id = node.hw_id;
-                let from_client_channel = from_client_channel.resubscribe();
+                let from_client_recv_channel = from_client_recv_channel.resubscribe();
 
                 let from_client_handle = tokio::spawn(async move {
                     tokio::select! {
                         _ = cancellation_token.cancelled() => {
-                            println!("Cancellation token cancelled, stopping message_relay worker");
+                            log::debug!("Cancellation token cancelled, stopping message_relay worker");
                         }
-                        _ = Engine::spawn_from_client_handler(from_client_channel, broadcast_send, node_id) => {
-                            println!("[{}] to_radio worker stopped", node_id);
+                        _ = Engine::spawn_from_client_handler(from_client_recv_channel, stream_api_to_radio_sender, node_id) => {
+                            log::debug!("[{}] to_radio worker stopped", node_id);
                         }
                     }
                 });
@@ -490,16 +538,8 @@ impl Engine {
             )
             .await?;
 
-        println!("Removed host container: {}", container_id);
+        log::info!("Removed host container: {}", container_id);
 
         Ok(())
-    }
-
-    pub fn get_nodes(&self) -> &Vec<Node> {
-        &self.nodes
-    }
-
-    pub fn get_nodes_mut(&mut self) -> &mut Vec<Node> {
-        &mut self.nodes
     }
 }
