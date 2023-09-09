@@ -26,6 +26,7 @@ pub const SIMULATION_HEIGHT: u32 = 100;
 pub const HW_ID_OFFSET: u32 = 16;
 pub const TCP_PORT_OFFSET: u32 = 4403;
 
+#[derive(Debug)]
 pub struct Engine {
     docker_client: Docker,
     host_container_id: Option<String>,
@@ -39,11 +40,9 @@ pub struct Engine {
 // Private helper methods
 
 impl Engine {
-    fn initialize_nodes(num_nodes: usize, bounding_box: Rectangle) -> Vec<Node> {
+    fn initialize_nodes(num_nodes: u32, bounding_box: Rectangle) -> Vec<Node> {
         (0..num_nodes)
             .map(|idx| {
-                let idx = idx as u32;
-
                 let id = Id::new(idx);
                 let hw_id = NodeId::new(idx + HW_ID_OFFSET);
 
@@ -95,7 +94,7 @@ impl Engine {
 // Public engine API
 
 impl Engine {
-    pub fn new(num_nodes: usize) -> Result<Self, utils::GenericError> {
+    pub fn new(num_nodes: u32) -> Result<Self, utils::GenericError> {
         let docker_client = Docker::connect_with_socket_defaults()?;
         let simulation_bounds = Rectangle {
             width: SIMULATION_WIDTH,
@@ -119,11 +118,11 @@ impl Engine {
     pub async fn create_host_container(
         &mut self,
         image_name: String,
-        tag: String,
+        image_tag: String,
     ) -> Result<(), utils::GenericError> {
         let create_image_options: CreateImageOptions<String> = CreateImageOptions {
             from_image: image_name.clone(),
-            tag,
+            tag: image_tag,
             ..Default::default()
         };
 

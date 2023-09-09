@@ -3,20 +3,21 @@
     windows_subsystem = "windows"
 )]
 
-use std::time::Duration;
+use std::sync::Arc;
 
-use simulation::engine::Engine;
+use tauri::{async_runtime, Manager};
 
+pub mod commands;
 pub mod graph;
 pub mod simulation;
+pub mod state;
 pub mod utils;
 
-pub const NUM_NODES: usize = 3;
+pub const NUM_NODES: u32 = 3;
 const IMAGE_NAME: &str = "meshtastic/device-simulator";
 const IMAGE_TAG: &str = "2.2.0.9f6584b"; // Latest
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+fn main() {
     fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
@@ -30,56 +31,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         .level(log::LevelFilter::Debug)
         .chain(std::io::stdout())
         // .chain(fern::log_file("output.log")?)
-        .apply()?;
+        .apply()
+        .expect("Failed to start logger");
+
+    log::info!("Logger started");
+
+    log::info!("Application starting...");
+
+    let initial_engine_state = state::EngineState {
+        inner: Arc::new(async_runtime::Mutex::new(None)),
+    };
 
     tauri::Builder::default()
+        .setup(|app| {
+            app.handle().manage(initial_engine_state);
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::engine::initialize_engine,
+            commands::engine::destroy_engine
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-
-    let mut engine = Engine::new(NUM_NODES)?;
-
-    match engine
-        .create_host_container(IMAGE_NAME.into(), IMAGE_TAG.into())
-        .await
-    {
-        Ok(_) => (),
-        Err(e) => {
-            log::error!("Failed to create host container: {}", e);
-            return Err(e);
-        }
-    };
-
-    // Let the nodes start up before configuration
-    log::info!("Waiting for nodes to start up...");
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    log::info!("Finished waiting for nodes to start up");
-
-    match engine.connect_to_nodes().await {
-        Ok(_) => (),
-        Err(e) => {
-            log::error!("Failed to connect to nodes: {}", e);
-            return Err(e);
-        }
-    };
-
-    println!("Waiting to remove container...");
-    engine.wait_for_user();
-
-    match engine.drop_node_connections().await {
-        Ok(_) => (),
-        Err(e) => {
-            log::error!("Failed to drop node connections: {}", e);
-            return Err(e);
-        }
-    }
-
-    match engine.remove_host_container().await {
-        Ok(_) => (),
-        Err(e) => {
-            log::error!("Failed to remove host container: {}", e);
-            return Err(e);
-        }
-    };
-
-    Ok(())
 }

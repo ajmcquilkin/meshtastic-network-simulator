@@ -1,10 +1,30 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { useState } from "react";
+import { invoke } from "@tauri-apps/api/tauri";
+import reactLogo from "@app/assets/react.svg";
+import viteLogo from "@app/assets/vite.svg";
+import "@app/App.css";
 
-function App() {
-  const [count, setCount] = useState(0)
+const App = () => {
+  const [isEngineInitialized, setEngineInitialized] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const handleButtonClick = async () => {
+    try {
+      setErrorMessage(null);
+      if (!isEngineInitialized) {
+        await invoke("initialize_engine", { numNodes: 3 });
+        setEngineInitialized(true);
+      } else {
+        await invoke("destroy_engine");
+        setEngineInitialized(false);
+      }
+    } catch (error) {
+      console.error("Failed to invoke command:", error);
+      setErrorMessage(
+        (error as string | null) ?? ("Command failed to execute" as string)
+      );
+    }
+  };
 
   return (
     <>
@@ -18,9 +38,10 @@ function App() {
       </div>
       <h1>Vite + React</h1>
       <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
+        <button onClick={handleButtonClick}>
+          Engine is {isEngineInitialized ? "initialized" : "not initialized"}
         </button>
+        {errorMessage && <p className="text-red-500">{errorMessage}</p>}
         <p>
           Edit <code>src/App.tsx</code> and save to test HMR
         </p>
@@ -29,7 +50,7 @@ function App() {
         Click on the Vite and React logos to learn more
       </p>
     </>
-  )
-}
+  );
+};
 
-export default App
+export default App;
