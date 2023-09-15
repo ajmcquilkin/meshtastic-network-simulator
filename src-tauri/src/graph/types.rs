@@ -111,9 +111,9 @@ impl PartialOrd<u8> for HopLimit {
 impl HopLimit {
     /// Creates a new HopLimit from a u8.
     /// Returns an error if the value is not in the range [0,7].
-    pub fn new(hop_limit: u8) -> Result<Self, String> {
+    pub fn new(hop_limit: u8) -> Result<Self, anyhow::Error> {
         if hop_limit > 7 {
-            return Err("Hop limit must be in range [0,7]".to_string());
+            return Err(anyhow::anyhow!("Hop limit must be in range [0,7]"));
         }
 
         Ok(HopLimit(hop_limit))

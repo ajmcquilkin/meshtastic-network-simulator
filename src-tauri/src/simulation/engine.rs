@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use crate::graph::node::Node;
 use crate::graph::types::{Id, TcpPort};
-use crate::utils;
 use bollard::container::{Config, RemoveContainerOptions};
 use bollard::exec::{CreateExecOptions, StartExecOptions};
 use bollard::image::CreateImageOptions;
@@ -75,7 +74,7 @@ impl Engine {
 
     fn generate_forwarded_mesh_packet(
         incoming_packet: protobufs::MeshPacket,
-    ) -> Result<protobufs::MeshPacket, String> {
+    ) -> Result<protobufs::MeshPacket, anyhow::Error> {
         let mut outgoing_packet = incoming_packet;
 
         match outgoing_packet.payload_variant {
@@ -83,7 +82,7 @@ impl Engine {
                 data.portnum = protobufs::PortNum::SimulatorApp.into();
             }
             _ => {
-                return Err("Received invalid mesh packet, skipping".to_string());
+                return Err(anyhow::anyhow!("Received invalid mesh packet, skipping"));
             }
         }
 
@@ -94,7 +93,7 @@ impl Engine {
 // Public engine API
 
 impl Engine {
-    pub fn new(num_nodes: u32) -> Result<Self, utils::GenericError> {
+    pub fn new(num_nodes: u32) -> Result<Self, anyhow::Error> {
         let docker_client = Docker::connect_with_socket_defaults()?;
         let simulation_bounds = Rectangle {
             width: SIMULATION_WIDTH,
@@ -119,7 +118,7 @@ impl Engine {
         &mut self,
         image_name: String,
         image_tag: String,
-    ) -> Result<(), utils::GenericError> {
+    ) -> Result<(), anyhow::Error> {
         let create_image_options: CreateImageOptions<String> = CreateImageOptions {
             from_image: image_name.clone(),
             tag: image_tag,
@@ -158,7 +157,9 @@ impl Engine {
                 ..Default::default()
             }),
             cmd: Some(Self::format_run_node_command(
-                self.nodes.get(0).ok_or("Could not find first node")?,
+                self.nodes
+                    .get(0)
+                    .ok_or(anyhow::anyhow!("Could not find first node"))?,
             )),
             user: Some("mesh".to_string()),
             ..Default::default()
@@ -391,17 +392,23 @@ impl Engine {
         }
     }
 
-    pub async fn connect_to_nodes(&mut self) -> Result<(), utils::GenericError> {
+    pub async fn connect_to_nodes(&mut self) -> Result<(), anyhow::Error> {
         for node in self.nodes.iter_mut() {
             // Configure node stream_api connection
 
-            let tcp_stream = build_tcp_stream(node.get_full_docker_tcp_address()).await?;
+            let tcp_stream = build_tcp_stream(node.get_full_docker_tcp_address())
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
             let stream_api = StreamApi::new();
 
             let (decoded_listener, stream_api) = stream_api.connect(tcp_stream).await;
 
             let config_id = generate_rand_id();
-            let stream_api = stream_api.configure(config_id).await?;
+            let stream_api = stream_api
+                .configure(config_id)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
             let node_cancellation_token = CancellationToken::new();
 
@@ -504,7 +511,7 @@ impl Engine {
             .expect("Failed to read line");
     }
 
-    pub async fn drop_node_connections(&mut self) -> Result<(), utils::GenericError> {
+    pub async fn drop_node_connections(&mut self) -> Result<(), anyhow::Error> {
         for node in self.nodes.iter_mut() {
             node.disconnect().await?;
         }
@@ -512,10 +519,10 @@ impl Engine {
         Ok(())
     }
 
-    pub async fn remove_host_container(&mut self) -> Result<(), utils::GenericError> {
-        let container_id = self.host_container_id.take().ok_or(
-            "Engine does not have a host container id, cannot remove container".to_string(),
-        )?;
+    pub async fn remove_host_container(&mut self) -> Result<(), anyhow::Error> {
+        let container_id = self.host_container_id.take().ok_or(anyhow::anyhow!(
+            "Engine does not have a host container id, cannot remove container"
+        ))?;
 
         self.docker_client
             .remove_container(

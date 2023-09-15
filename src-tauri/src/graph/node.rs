@@ -2,7 +2,7 @@ use meshtastic::{api::ConnectedStreamApi, types::NodeId};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{simulation::point::Point, utils};
+use crate::simulation::point::Point;
 
 use super::types::{HopLimit, Id, TcpPort};
 
@@ -55,9 +55,12 @@ impl Node {
         }
     }
 
-    pub async fn disconnect(&mut self) -> Result<(), utils::GenericError> {
+    pub async fn disconnect(&mut self) -> Result<(), anyhow::Error> {
         if let Some(stream_api) = self.stream_api.take() {
-            stream_api.disconnect().await?;
+            stream_api
+                .disconnect()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
 
         if let Some(cancellation_token) = self.cancellation_token.take() {
